@@ -6,13 +6,16 @@
 [![GitHub Sponsor](https://img.shields.io/badge/Sponsor-GitHub-Repository-pink.svg?style=flat-square&logo=github-sponsors)](https://github.com/sponsors/Almoon-D)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Donate-orange.svg?style=flat-square&logo=buy-me-a-coffee)](https://buymeacoffee.com/almoon.d)
 
-**IBKR Portmanteau** is an institutional-grade, unified financial server built on the **Model Context Protocol (MCP)** standard. Designed strictly as a **Read-Only** gateway, it provides an ultra-secure channel for your Large Language Models (LLMs) within environments like Cursor, Claude Desktop, or VS Code to explore, analyze, and extract advanced metrics from your portfolio and global markets in real time.
+**IBKR Portmanteau** is a unified financial server built on the **Model Context Protocol (MCP)** standard. Designed strictly as a **Read-Only** gateway, it provides an ultra-secure channel for your Large Language Models (LLMs) within environments like Cursor, Claude Desktop, ChatGPT, Gemini or VS Code to explore, analyze, and extract advanced metrics from your portfolio and global markets in real time.
+
+## 🌐 Deploy Anywhere (Local & Cloud Ready)
+Whether you want to run it on your own machine for quick analysis or host it on a private online server (VPS) for a 24/7, always-on AI data bridge, the core architecture is built to stay lightweight, stable, safe and completely decoupled from a single desktop environment.
 
 ### Built-in Native Bridges:
-* **Interactive Brokers (Client Portal API)**: Real-time portfolio balances, consolidated positions, and optional *on-platform* market data snapshots.
+* **Interactive Brokers (Client Portal API)**: Real-time portfolio balances, consolidated positions, and optional ***on-platform* market data snapshots.**
+* **FRED (Federal Reserve Bank of St. Louis)** & **World Bank**: Dynamic global macroeconomic scanner utilizing direct passthrough queries.
 * **Yahoo Finance**: Automated fallback layer for global multi-market equity quotes, tailorable historical data windows, and full options chains.
 * **Binance**: Spot cryptocurrency data feeds tracking prices, execution spreads, and concurrent funding rates.
-* **FRED (Federal Reserve Bank of St. Louis)** & **World Bank**: Dynamic global macroeconomic scanner utilizing direct passthrough queries.
 
 ---
 
