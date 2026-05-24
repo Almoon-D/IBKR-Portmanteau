@@ -1,12 +1,10 @@
 """
-IBKR Portmanteau — Institutional Grade Unified Financial Server (Read-Only)
+IBKR Portmanteau — Unified Financial Server (Read-Only)
 Data Sources : IBKR Client Portal · FRED · World Bank · Yahoo Finance · Binance
 Transport    : STDIO (Local) / SSE (Remote)
-Cache        : AIOSQLITE (100% Asynchronous)
+Cache        : AIOSQLITE (Asynchronous with Memory Fallback)
 Math Engine  : Native Black-Scholes for exact Greeks calculation.
-Python       : 3.11+ Compatible (Optimized for 3.14.5)
-
-Copyright (C) 2026 AlmoonD - Licensed under the GNU GPLv3
+Python       : 3.11+ Compatible (Optimized for 3.14)
 """
 
 import asyncio
@@ -69,10 +67,26 @@ WORLD_BANK_INDICATORS = {
     "GDP_PER_CAPITA": "NY.GDP.PCAP.CD"
 }
 
+# --- Thread-Safe Isolated Wrappers for yfinance Global Executor Calls ---
+def _fetch_yf_options_list(ticker: str):
+    return yf.Ticker(ticker).options
+
+def _fetch_yf_option_chain(ticker: str, expiry: str):
+    return yf.Ticker(ticker).option_chain(expiry)
+
+def _fetch_yf_fast_info(ticker: str):
+    return yf.Ticker(ticker).fast_info
+
+def _fetch_yf_history(ticker: str, period: str, interval: str):
+    return yf.Ticker(ticker).history(period=period, interval=interval)
+
 def _safe_float(val: Any, default: float = 0.0) -> float:
-    if val is None: return default
-    try: return float(str(val).strip().replace(",", ""))
-    except (ValueError, TypeError): return default
+    if val is None: 
+        return default
+    try: 
+        return float(str(val).strip().replace(",", ""))
+    except (ValueError, TypeError): 
+        return default
 
 def _cnd(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -105,15 +119,24 @@ class AsyncCacheManager:
         self._db: Optional[aiosqlite.Connection] = None
 
     async def init(self) -> None:
-        self._db = await aiosqlite.connect(self.db_path)
-        await self._db.execute("CREATE TABLE IF NOT EXISTS mcp_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires REAL NOT NULL)")
-        await self._db.commit()
-        log.info("Asynchronous AIOSQLITE cache active.")
+        try:
+            self._db = await aiosqlite.connect(self.db_path)
+            await self._db.execute("CREATE TABLE IF NOT EXISTS mcp_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires REAL NOT NULL)")
+            await self._db.commit()
+            log.info(f"Asynchronous AIOSQLITE cache initialized at: {self.db_path}")
+        except Exception as e:
+            log.error(f"Failed to initialize file-based SQLite database cache ({e}). Falling back to volatile in-memory storage.")
+            self._db = await aiosqlite.connect(":memory:")
+            await self._db.execute("CREATE TABLE IF NOT EXISTS mcp_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires REAL NOT NULL)")
+            await self._db.commit()
 
     async def get(self, key: str) -> Optional[Any]:
+        if not self._db:
+            return None
         async with self._db.execute("SELECT value, expires FROM mcp_cache WHERE key = ?", (key,)) as cursor:
             row = await cursor.fetchone()
-            if not row: return None
+            if not row: 
+                return None
             value, expires = row
             if time.time() > expires:
                 await self._db.execute("DELETE FROM mcp_cache WHERE key = ?", (key,))
@@ -122,12 +145,15 @@ class AsyncCacheManager:
             return json.loads(value)
 
     async def set(self, key: str, value: Any, ttl_secs: int) -> None:
+        if not self._db:
+            return
         expires = time.time() + ttl_secs
         await self._db.execute("INSERT OR REPLACE INTO mcp_cache (key, value, expires) VALUES (?, ?, ?)", (key, json.dumps(value), expires))
         await self._db.commit()
 
     async def close(self) -> None:
-        if self._db: await self._db.close()
+        if self._db: 
+            await self._db.close()
 
 class IBKRGateway:
     def __init__(self) -> None:
@@ -142,8 +168,10 @@ class IBKRGateway:
     async def stop(self) -> None:
         if self._tickle_task:
             self._tickle_task.cancel()
-            try: await self._tickle_task
-            except asyncio.CancelledError: pass
+            try: 
+                await self._tickle_task
+            except asyncio.CancelledError: 
+                pass
         await self.client.aclose()
 
     async def comprobar_estado_inmediato(self) -> None:
@@ -159,8 +187,14 @@ class IBKRGateway:
 
     async def _loop_mantenimiento(self) -> None:
         while True:
-            await asyncio.sleep(IBKR_TICKLE_SECS)
-            await self.comprobar_estado_inmediato()
+            try:
+                await asyncio.sleep(IBKR_TICKLE_SECS)
+                await self.comprobar_estado_inmediato()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.exception(f"Unexpected exception in IBKR maintenance loop loop: {e}. Retrying execution in 10 seconds.")
+                await asyncio.sleep(10)
 
     async def resolve_conid(self, ticker: str) -> Optional[int]:
         try:
@@ -170,7 +204,8 @@ class IBKRGateway:
                     if asset.get("ticker", "").upper() == ticker.upper():
                         return int(asset["conid"])
                 return int(resp.json()[0]["conid"])
-        except Exception: pass
+        except Exception: 
+            pass
         return None
 
 class MarketFacade:
@@ -179,7 +214,7 @@ class MarketFacade:
         self.cache = cache
         self.http = httpx.AsyncClient(timeout=12.0)
         self.semaphore = asyncio.Semaphore(4)
-        self.ibkr_semaphore = asyncio.Semaphore(2)
+        self.ibkr_semaphore = asyncio.Semaphore(2)  
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -187,7 +222,9 @@ class MarketFacade:
     async def search_instrument(self, query: str) -> dict[str, Any]:
         cache_key = f"search:{query.lower()}"
         cached = await self.cache.get(cache_key)
-        if cached: return cached
+        if cached: 
+            return cached
+        
         async with self.semaphore:
             try:
                 resp = await self.http.get(YAHOO_SEARCH_URL, params={"q": query, "quotesCount": 5, "newsCount": 0})
@@ -204,7 +241,8 @@ class MarketFacade:
                     final_res = {"query": query, "matches": results}
                     await self.cache.set(cache_key, final_res, TTL_SEARCH_SECS)
                     return final_res
-            except Exception as e: return {"error": str(e), "matches": []}
+            except Exception as e:
+                return {"error": str(e), "matches": []}
         return {"query": query, "matches": []}
 
     async def get_spot_price(self, ticker: str, asset_class: str) -> dict[str, Any]:
@@ -214,7 +252,9 @@ class MarketFacade:
             ticker = f"{ticker}USDT"
         cache_key = f"spot:{asset_class}:{ticker}"
         cached = await self.cache.get(cache_key)
-        if cached: return cached
+        if cached: 
+            return cached
+
         if asset_class == "CRYPTO":
             async with self.semaphore:
                 try:
@@ -222,7 +262,7 @@ class MarketFacade:
                     fund_task = self.http.get(BINANCE_FUND_URL, params={"symbol": ticker})
                     spot_resp, fund_resp = await asyncio.gather(spot_task, fund_task, return_exceptions=True)
                     if isinstance(spot_resp, Exception) or spot_resp.status_code != 200:
-                        return {"error": "Asset not found on Binance Spot", "source": "ERROR"}
+                        return {"error": "Asset not found on Binance Spot layer", "source": "ERROR"}
                     spot_data = spot_resp.json()
                     funding_rate = None
                     if not isinstance(fund_resp, Exception) and fund_resp.status_code == 200:
@@ -230,7 +270,9 @@ class MarketFacade:
                     result = {"ticker": ticker, "source": "[SOURCE: BINANCE]", "last": _safe_float(spot_data.get("lastPrice")), "bid": _safe_float(spot_data.get("bidPrice")), "ask": _safe_float(spot_data.get("askPrice")), "volume_24h": _safe_float(spot_data.get("volume")), "funding_rate_pct": funding_rate}
                     await self.cache.set(cache_key, result, TTL_EQUITY_SECS)
                     return result
-                except Exception as e: return {"error": str(e), "source": "ERROR"}
+                except Exception as e: 
+                    return {"error": str(e), "source": "ERROR"}
+
         if self.ibkr.healthy:
             async with self.ibkr_semaphore:
                 conid = await self.ibkr.resolve_conid(ticker)
@@ -244,56 +286,69 @@ class MarketFacade:
                                 result = {"ticker": ticker, "source": "[SOURCE: IBKR]", "last": last, "bid": _safe_float(snap.get("84")), "ask": _safe_float(snap.get("86")), "conid": conid}
                                 await self.cache.set(cache_key, result, TTL_EQUITY_SECS)
                                 return result
-                    except Exception: pass
+                    except Exception: 
+                        pass
+
         async with self.semaphore:
             try:
                 loop = asyncio.get_running_loop()
-                info = await loop.run_in_executor(None, lambda: yf.Ticker(ticker).fast_info)
+                info = await loop.run_in_executor(None, _fetch_yf_fast_info, ticker)
                 result = {"ticker": ticker, "source": "[SOURCE: YAHOO_FALLBACK]", "last": getattr(info, "last_price", None), "bid": getattr(info, "bid", None), "ask": getattr(info, "ask", None)}
                 await self.cache.set(cache_key, result, TTL_EQUITY_SECS)
                 return result
-            except Exception as e: return {"error": str(e), "source": "ERROR"}
+            except Exception as e: 
+                return {"error": str(e), "source": "ERROR"}
 
     async def get_historical_ohlcv(self, ticker: str, interval: str, period: str, limit: int) -> dict[str, Any]:
         cache_key = f"hist:{ticker}:{interval}:{period}:{limit}"
         cached = await self.cache.get(cache_key)
-        if cached: return cached
+        if cached: 
+            return cached
         async with self.semaphore:
             try:
                 loop = asyncio.get_running_loop()
-                df = await loop.run_in_executor(None, lambda: yf.Ticker(ticker).history(period=period, interval=interval))
-                if df.empty: return {"error": "Historical data unavailable"}
+                df = await loop.run_in_executor(None, _fetch_yf_history, ticker, period, interval)
+                if df.empty: 
+                    return {"error": "Historical data series unavailable"}
                 bars = []
                 for idx, row in df.tail(limit).iterrows():
                     bars.append({"timestamp": idx.strftime("%Y-%m-%d %H:%M"), "open": round(row["Open"], 2), "high": round(row["High"], 2), "low": round(row["Low"], 2), "close": round(row["Close"], 2), "volume": int(row["Volume"])})
                 result = {"ticker": ticker, "source": "[SOURCE: YAHOO_PRO]", "interval": interval, "bars": bars}
                 await self.cache.set(cache_key, result, TTL_EQUITY_SECS)
                 return result
-            except Exception as e: return {"error": str(e)}
+            except Exception as e: 
+                return {"error": str(e)}
 
     async def get_fx_rate(self, base: str, quote: str) -> dict[str, Any]:
         pair = f"{base.upper()}{quote.upper()}=X"
         cache_key = f"fx:{pair}"
         cached = await self.cache.get(cache_key)
-        if cached: return cached
+        if cached: 
+            return cached
         async with self.semaphore:
             try:
                 loop = asyncio.get_running_loop()
-                info = await loop.run_in_executor(None, lambda: yf.Ticker(pair).fast_info)
+                info = await loop.run_in_executor(None, _fetch_yf_fast_info, pair)
                 last_rate = getattr(info, "last_price", None)
-                if not last_rate: return {"error": f"Could not extract fx rate for {pair}"}
+                if not last_rate: 
+                    return {"error": f"Could not extract fx rate structural analytics for {pair}"}
                 result = {"pair": pair, "rate": round(last_rate, 4), "timestamp": datetime.now(timezone.utc).isoformat()}
                 await self.cache.set(cache_key, result, 300)
                 return result
-            except Exception as e: return {"error": str(e)}
+            except Exception as e: 
+                return {"error": str(e)}
 
     async def get_options_chain_with_greeks(self, ticker: str, max_dte: int, moneyness: float, rate_pct: float) -> dict[str, Any]:
         cache_key = f"greeks_chain:{ticker}:{max_dte}:{moneyness}"
         cached = await self.cache.get(cache_key)
-        if cached: return cached
+        if cached: 
+            return cached
+
         spot_dict = await self.get_spot_price(ticker, "STK")
         spot_price = _safe_float(spot_dict.get("last"))
-        if spot_price <= 0: return {"error": "Cannot calculate options chain without a valid spot price."}
+        if spot_price <= 0:
+            return {"error": "Cannot track or calculate derivatives without valid underlying snapshot spot pricing metrics."}
+
         if self.ibkr.healthy:
             try:
                 async with self.ibkr_semaphore:
@@ -301,58 +356,70 @@ class MarketFacade:
                     if conid:
                         opt_resp = await self.ibkr.client.get(f"{IBKR_BASE}/iserver/secdef/info", params={"conid": conid, "secType": "OPT"})
                         if opt_resp.status_code == 200 and opt_resp.json():
-                            log.info("Mapping native IBKR options contracts for %s", ticker)
                             raw_contracts = opt_resp.json()
+                            
                             filtered_contracts = []
                             for c in raw_contracts:
-                                if not isinstance(c, dict): continue
+                                if not isinstance(c, dict): 
+                                    continue
                                 strike = _safe_float(c.get("strike"))
                                 if (spot_price * (1 - moneyness) <= strike <= spot_price * (1 + moneyness)):
                                     filtered_contracts.append(c)
+                            
                             opt_conids = [str(c["conid"]) for c in filtered_contracts[:40]]
                             if opt_conids:
                                 snap_resp = await self.ibkr.client.get(f"{IBKR_BASE}/iserver/marketdata/snapshot", params={"conids": ",".join(opt_conids), "fields": "31,84,86,7644"})
                                 if snap_resp.status_code == 200 and snap_resp.json():
                                     snapshots = {str(s.get("conid")): s for s in snap_resp.json() if isinstance(s, dict)}
                                     processed_contracts = []
+                                    
                                     for c in filtered_contracts[:40]:
                                         c_conid = str(c.get("conid"))
                                         if c_conid in snapshots:
                                             snap = snapshots[c_conid]
                                             strike = _safe_float(c.get("strike"))
                                             iv_raw = _safe_float(snap.get("7644"))
+                                            
                                             iv_val = iv_raw if iv_raw > 0 else 0.32
                                             is_call = str(c.get("right", "C")).upper().startswith("C")
                                             expiry_str = c.get("expiry", "")
                                             try:
                                                 expiry_dt = datetime.strptime(expiry_str, "%Y%m%d").replace(tzinfo=timezone.utc)
                                                 dte = (expiry_dt - datetime.now(timezone.utc)).days
-                                            except Exception: dte = 30
+                                            except Exception: 
+                                                dte = 30
+                                            
                                             greeks = calculate_greeks(spot_price, strike, max(dte, 1), iv_val * 100, rate_pct, is_call)
                                             processed_contracts.append({"contractSymbol": c.get("symbol", f"{ticker}_{expiry_str}_{strike}"), "type": "CALL" if is_call else "PUT", "expiry": expiry_str, "strike": strike, "bid": _safe_float(snap.get("84")), "ask": _safe_float(snap.get("86")), "iv_pct": round(iv_val * 100, 2), "greeks": greeks, "source": "IBKR_NATIVE"})
+                                    
                                     if processed_contracts:
                                         result = {"ticker": ticker, "underlying_price": round(spot_price, 2), "option_contracts": processed_contracts}
                                         await self.cache.set(cache_key, result, TTL_EQUITY_SECS)
                                         return result
-            except Exception: pass
+            except Exception: 
+                pass
+
         async with self.semaphore:
             loop = asyncio.get_running_loop()
             try:
-                yf_ticker = yf.Ticker(ticker)
-                expirations = await loop.run_in_executor(None, lambda: yf_ticker.options)
+                expirations = await loop.run_in_executor(None, _fetch_yf_options_list, ticker)
                 cutoff = datetime.now(timezone.utc) + timedelta(days=max_dte)
                 valid_expirations = [e for e in expirations if datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) <= cutoff]
                 target_expirations = valid_expirations[:4]
-                tasks = [loop.run_in_executor(None, lambda e=exp: yf_ticker.option_chain(e)) for exp in target_expirations]
+                
+                # Fixed: Instantiating isolated Ticker wrappers per worker context inside thread pool to safeguard thread safety
+                tasks = [loop.run_in_executor(None, _fetch_yf_option_chain, ticker, exp) for exp in target_expirations]
                 chains = await asyncio.gather(*tasks, return_exceptions=True)
                 processed_contracts = []
                 for exp, chain in zip(target_expirations, chains):
-                    if isinstance(chain, Exception): continue
+                    if isinstance(chain, Exception): 
+                        continue
                     for is_call, df in [(True, chain.calls), (False, chain.puts)]:
                         tipo = "CALL" if is_call else "PUT"
                         for _, row in df.iterrows():
                             strike = _safe_float(row.get("strike"))
-                            if not (spot_price * (1 - moneyness) <= strike <= spot_price * (1 + moneyness)): continue
+                            if not (spot_price * (1 - moneyness) <= strike <= spot_price * (1 + moneyness)): 
+                                continue
                             iv = _safe_float(row.get("impliedVolatility"))
                             iv_val = iv if iv > 0 else 0.32
                             dte = (datetime.strptime(exp, "%Y-%m-%d").replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
@@ -361,7 +428,8 @@ class MarketFacade:
                 result = {"ticker": ticker, "underlying_price": round(spot_price, 2), "option_contracts": processed_contracts[:80]}
                 await self.cache.set(cache_key, result, TTL_EQUITY_SECS)
                 return result
-            except Exception as e: return {"error": f"Options chain tracking failed: {e}"}
+            except Exception as e: 
+                return {"error": f"Options chain tracking execution layer failure: {e}"}
 
 class MacroProvider:
     def __init__(self, cache: AsyncCacheManager) -> None:
@@ -375,18 +443,22 @@ class MacroProvider:
         region = region.upper()
         cache_key = f"dyn_macro:{indicator_id}:{region}"
         cached = await self.cache.get(cache_key)
-        if cached: return cached
+        if cached: 
+            return cached
+        
         series_id = FRED_SERIES.get(indicator_id.upper(), indicator_id)
         if region in ("US", "USA") and FRED_API_KEY:
             try:
-                resp = await self.http.get(FRED_BASE, params={"series_id": series_id, "api_key": FRED_API_KEY, "file_type": "json", "sort_order": "desc", "limit": 10})
+                resp = await self.http.get(FRED_BASE, params={"series_id": series_id, "api_key": FRED_API_KEY, "file_type": "json", "sort_order": "desc", "limit": 15})
                 if resp.status_code == 200:
                     obs = resp.json().get("observations", [])
                     history = [{"date": o["date"], "value": _safe_float(o["value"])} for o in reversed(obs) if o["value"] not in (".", "")]
                     result = {"indicator": series_id, "region": "US", "source": "FRED", "series": history}
                     await self.cache.set(cache_key, result, TTL_MACRO_SECS)
                     return result
-            except Exception: pass
+            except Exception: 
+                pass
+
         wb_code = WORLD_BANK_INDICATORS.get(indicator_id.upper(), indicator_id)
         try:
             resp = await self.http.get(f"https://api.worldbank.org/v2/country/{region}/indicator/{wb_code}", params={"format": "json", "per_page": 20})
@@ -399,18 +471,21 @@ class MacroProvider:
                 result = {"indicator": wb_code, "region": region_name, "source": "WORLD_BANK", "series": history}
                 await self.cache.set(cache_key, result, TTL_MACRO_SECS)
                 return result
-        except Exception as e: return {"error": str(e)}
-        return {"error": f"Indicator '{indicator_id}' or region '{region}' not reachable."}
+        except Exception as e: 
+            return {"error": str(e)}
+        return {"error": f"Indicator reference '{indicator_id}' or regional metric allocation '{region}' targets not reached."}
 
 class PortfolioEngine:
     def __init__(self, ibkr: IBKRGateway) -> None:
         self.ibkr = ibkr
 
     async def analyze(self) -> dict[str, Any]:
-        if not self.ibkr.healthy: return {"status": "OFFLINE", "error": "Local IBKR Gateway disconnected"}
+        if not self.ibkr.healthy: 
+            return {"status": "OFFLINE", "error": "Local native execution IBKR Gateway proxy disconnected"}
         try:
             acct_resp = await self.ibkr.client.get(f"{IBKR_BASE}/portfolio/accounts")
-            if acct_resp.status_code != 200 or not acct_resp.json(): return {"status": "ERROR", "error": "Failed to map IBKR account target"}
+            if acct_resp.status_code != 200 or not acct_resp.json(): 
+                return {"status": "ERROR", "error": "Failed to map target account vectors on IBKR infrastructure link"}
             acct_id = acct_resp.json()[0]["id"]
             ledger_resp = await self.ibkr.client.get(f"{IBKR_BASE}/portfolio/{acct_id}/ledger")
             ledger_data = ledger_resp.json()
@@ -421,7 +496,8 @@ class PortfolioEngine:
                 buying_power = _safe_float(base.get("buyingpower"))
             else:
                 for currency, data in ledger_data.items():
-                    if currency == "BASE" or not isinstance(data, dict): continue
+                    if currency == "BASE" or not isinstance(data, dict): 
+                        continue
                     rate = _safe_float(data.get("exchangeRate", 1.0))
                     nlv += _safe_float(data.get("netliquidationvalue")) * rate
                     buying_power += _safe_float(data.get("buyingpower")) * rate
@@ -433,13 +509,15 @@ class PortfolioEngine:
                     mkt_val = _safe_float(p.get("mktValue"))
                     asset_class = p.get("assetClass", "UNKNOWN")
                     processed_positions.append({"contract": p.get("contractDesc", p.get("ticker", "UNKNOWN")), "asset_class": asset_class, "size": _safe_float(p.get("position")), "market_value": round(mkt_val, 2), "weight_pct": round((mkt_val / nlv * 100), 2) if nlv > 0 else 0.0})
-                    if asset_class in ("STK", "ETF", "OPT"): total_market_exposure += mkt_val
+                    if asset_class in ("STK", "ETF", "OPT"): 
+                        total_market_exposure += mkt_val
             stress_scenarios = {}
             for crash in [10, 20]:
                 loss = total_market_exposure * (crash / 100.0)
                 stress_scenarios[f"crash_{crash}pct"] = {"estimated_loss": round(loss, 2), "remaining_nlv": round(nlv - loss, 2)}
-            return {"account_id": acct_id, "nlv_consolidado": round(nlv, 2), "buying_power": round(buying_power, 2), "total_exposure": round(total_market_exposure, 2), "positions": processed_positions, "stress_scenarios": stress_scenarios}
-        except Exception as e: return {"error": str(e)}
+            return {"account_id": acct_id, "nlv_consolidated": round(nlv, 2), "buying_power": round(buying_power, 2), "total_exposure": round(total_market_exposure, 2), "positions": processed_positions, "stress_scenarios": stress_scenarios}
+        except Exception as e: 
+            return {"error": str(e)}
 
 _cache: Optional[AsyncCacheManager] = None
 _ibkr: Optional[IBKRGateway] = None
@@ -503,7 +581,6 @@ async def get_global_macro_scanner(indicator_id: str, region: str) -> str:
 @mcp.tool(name="query_ibkr_endpoint")
 async def query_ibkr_endpoint(endpoint: str, params_json: Optional[str] = None) -> str:
     """Bypass high-level tools and execute direct queries against the IBKR Client Portal REST API."""
-    if not _ibkr.healthy: return json.dumps({"error": "Local IBKR Gateway disconnected"})
     try:
         p = json.loads(params_json) if params_json else {}
         url = f"{IBKR_BASE}/{endpoint.lstrip('/')}"
@@ -512,12 +589,14 @@ async def query_ibkr_endpoint(endpoint: str, params_json: Optional[str] = None) 
         else:
             resp = await _ibkr.client.get(url, params=p)
         return json.dumps(resp.json(), indent=2)
-    except Exception as e: return json.dumps({"error": str(e)})
+    except Exception as e: 
+        return json.dumps({"error": str(e)})
 
 @mcp.tool(name="search_fred_series")
 async def search_fred_series(query: str) -> str:
     """Search the FRED database for economic series identifiers matching a query string."""
-    if not FRED_API_KEY: return json.dumps({"error": "FRED API Key not configured"})
+    if not FRED_API_KEY: 
+        return json.dumps({"error": "FRED API Key not configured"})
     try:
         url = "https://api.stlouisfed.org/fred/series/search"
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -526,8 +605,9 @@ async def search_fred_series(query: str) -> str:
                 ser = resp.json().get("seriess", [])
                 results = [{"id": s.get("id"), "title": s.get("title"), "frequency": s.get("frequency"), "units": s.get("units")} for s in ser]
                 return json.dumps({"query": query, "results": results}, indent=2)
-            return json.dumps({"error": f"FRED API returned status {resp.status_code}"})
-    except Exception as e: return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"FRED API returned unexpected status code {resp.status_code}"})
+    except Exception as e: 
+        return json.dumps({"error": str(e)})
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
