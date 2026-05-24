@@ -67,18 +67,29 @@ WORLD_BANK_INDICATORS = {
     "GDP_PER_CAPITA": "NY.GDP.PCAP.CD"
 }
 
-# --- Thread-Safe Isolated Wrappers for yfinance Global Executor Calls ---
+# --- Thread-Safe Isolated Wrappers for yfinance Global Executor Calls with Retry Logic ---
+def _with_retry(func, max_retries=3):
+    for i in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if i == max_retries - 1:
+                raise e
+            sleep_time = 2 ** i
+            log.warning(f"yfinance request failed ({e}). Retrying in {sleep_time}s...")
+            time.sleep(sleep_time)
+
 def _fetch_yf_options_list(ticker: str):
-    return yf.Ticker(ticker).options
+    return _with_retry(lambda: yf.Ticker(ticker).options)
 
 def _fetch_yf_option_chain(ticker: str, expiry: str):
-    return yf.Ticker(ticker).option_chain(expiry)
+    return _with_retry(lambda: yf.Ticker(ticker).option_chain(expiry))
 
 def _fetch_yf_fast_info(ticker: str):
-    return yf.Ticker(ticker).fast_info
+    return _with_retry(lambda: yf.Ticker(ticker).fast_info)
 
 def _fetch_yf_history(ticker: str, period: str, interval: str):
-    return yf.Ticker(ticker).history(period=period, interval=interval)
+    return _with_retry(lambda: yf.Ticker(ticker).history(period=period, interval=interval))
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
     if val is None: 
@@ -157,7 +168,15 @@ class AsyncCacheManager:
 
 class IBKRGateway:
     def __init__(self) -> None:
-        self.client = httpx.AsyncClient(verify=False, timeout=10.0)
+        ca_cert = os.environ.get("IBKR_CACERT")
+        if ca_cert and os.path.exists(ca_cert):
+            verify_value = ca_cert
+            log.info(f"Using custom CA certificate for secure IBKR verification: {ca_cert}")
+        else:
+            verify_value = False
+            log.warning("IBKR_CACERT environment variable not set or file not found. Falling back to verify=False (Insecure).")
+            
+        self.client = httpx.AsyncClient(verify=verify_value, timeout=10.0)
         self.healthy = False
         self._tickle_task: Optional[asyncio.Task[None]] = None
 
@@ -193,7 +212,7 @@ class IBKRGateway:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.exception(f"Unexpected exception in IBKR maintenance loop loop: {e}. Retrying execution in 10 seconds.")
+                log.exception(f"Unexpected exception in IBKR maintenance loop: {e}. Retrying execution in 10 seconds.")
                 await asyncio.sleep(10)
 
     async def resolve_conid(self, ticker: str) -> Optional[int]:
@@ -407,7 +426,6 @@ class MarketFacade:
                 valid_expirations = [e for e in expirations if datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) <= cutoff]
                 target_expirations = valid_expirations[:4]
                 
-                # Fixed: Instantiating isolated Ticker wrappers per worker context inside thread pool to safeguard thread safety
                 tasks = [loop.run_in_executor(None, _fetch_yf_option_chain, ticker, exp) for exp in target_expirations]
                 chains = await asyncio.gather(*tasks, return_exceptions=True)
                 processed_contracts = []
@@ -542,6 +560,25 @@ async def app_lifespan(_server: Any) -> AsyncIterator[None]:
     await _cache.close()
 
 mcp = FastMCP("ibkr_portmanteau", lifespan=app_lifespan)
+
+# --- MCP Resources for LLM Context Ingestion ---
+@mcp.resource("manuals://exploration_manual")
+def exploration_manual() -> str:
+    """Global Macro & Market Data Exploration Manual Guidelines"""
+    try:
+        with open("GLOBAL_DATA_EXPLORATION_MANUAL.md", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error loading exploration manual path: {str(e)}"
+
+@mcp.resource("manuals://api_reference")
+def api_reference() -> str:
+    """IBKR Portmanteau Client Portal API Routing Blueprint"""
+    try:
+        with open("IBKR_PORTMANTEAU_API_REFERENCE.md", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error loading API reference path: {str(e)}"
 
 @mcp.tool(name="search_instrument")
 async def search_instrument(query: str) -> str:
