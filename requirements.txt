@@ -1,0 +1,5 @@
+httpx>=0.28.1
+yfinance>=1.4.0
+aiosqlite>=0.22.1
+mcp>=1.27.1
+urllib3>=2.7.0
