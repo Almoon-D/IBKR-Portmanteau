@@ -1,4 +1,6 @@
-# IBKR Portmanteau 💼🌐
+<h1 align="center">IBKR Portmanteau</h1>
+
+<img width="4128" height="1024" alt="Gemini_Generated_Image_7r3gwh7r3gwh7r3g" src="https://github.com/user-attachments/assets/bc6d3baf-4d32-43af-8cda-c6e4f78f62c0" />
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Python Version](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://www.python.org/)
@@ -111,6 +113,10 @@ Once initialized, the server automatically registers the following analytical ca
 4. `get_fx_rate`: Spot currency exchange rate conversion matching live data layers (essential for multi-asset opportunistic accounts).
 5. `get_options_chain_with_greeks`: Options liquidity chain ingestion, computing real-time **Delta, Gamma, Vega, and Theta** metrics via a native Black-Scholes mathematical engine.
 6. `get_portfolio_summary`: Automated consolidated balance sweeps, Net Liquidation Value (NLV) calculations, and **immediate portfolio stress-testing scenarios under market drops (-10%, -20%)**.
+
+---
+
+<img width="2816" height="1536" alt="Gemini_Generated_Image_t4sk66t4sk66t4sk" src="https://github.com/user-attachments/assets/3e10f8f9-4531-4b5f-9a92-b79c96c4445b" />
 
 ---
 
