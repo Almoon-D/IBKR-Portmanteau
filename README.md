@@ -13,11 +13,11 @@
 ## 🌐 Deploy Anywhere (Local & Cloud Ready)
 Whether you want to run it on your own machine for quick analysis or host it on a private online server (VPS) for a 24/7, always-on AI data bridge, the core architecture is built to stay lightweight, stable, safe and completely decoupled from a single desktop environment.
 
-### Built-in Native Bridges:
-* **Interactive Brokers (Client Portal API)**: Real-time portfolio balances, consolidated positions, and optional ***on-platform* market data snapshots.**
-* **FRED (Federal Reserve Bank of St. Louis)** & **World Bank**: Dynamic global macroeconomic scanner utilizing direct passthrough queries.
-* **Yahoo Finance**: Automated fallback layer for global multi-market equity quotes, tailorable historical data windows, and full options chains.
-* **Binance**: Spot cryptocurrency data feeds tracking prices, execution spreads, and concurrent funding rates.
+### Architectural Highlights & Native Bridges:
+* **Interactive Brokers (Client Portal API)**: Real-time balances, consolidated position sweeps, and hybrid option chain matching via direct platform data pipelines.
+* **Direct Async Network Stack**: Bypasses synchronous library limits by communicating directly with raw Yahoo Finance, Binance, FRED, and World Bank JSON endpoints via `httpx`.
+* **Active-Evict Memory Cache**: Eliminates database file write-locking bottlenecks using a lock-isolated memory engine featuring automated background eviction tasks to protect against long-tail memory leaks.
+* **Vectorized Math Engine**: High-precision NumPy matrix operations calculating Black-Scholes-Merton option surfaces with an embedded real-time Newton-Raphson Implied Volatilities solver.
 
 ---
 
@@ -25,7 +25,7 @@ Whether you want to run it on your own machine for quick analysis or host it on 
 
 The server architecture is built to run seamlessly across the following Python environments:
 * **Python 3.11, 3.12, and 3.13** (Full production backward compatibility).
-* **Python 3.14.5** (Fully optimized execution leveraging the latest asynchronous event loop performance enhancements).
+* **Python 3.14** (Fully optimized execution leveraging the latest asynchronous event loop performance enhancements).
 
 All runtime dependencies are strictly managed within the accompanying `requirements.txt` file.
 
@@ -37,7 +37,7 @@ All runtime dependencies are strictly managed within the accompanying `requireme
 Open your terminal and run the following commands to set up an isolated virtual environment:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ibkr-portmanteau.git
+git clone [https://github.com/YOUR_USERNAME/ibkr-portmanteau.git](https://github.com/YOUR_USERNAME/ibkr-portmanteau.git)
 cd ibkr-portmanteau
 
 # Create and activate the virtual environment
@@ -74,6 +74,32 @@ To spin up the server instance under the standard STDIO transport layer (fully i
 python server.py --transport stdio
 ```
 
+### 5. AI Client Integration (Claude Desktop / Cursor)
+To connect this server directly to your AI development environment, update your client settings file.
+
+#### For Claude Desktop
+Add this snippet to your `claude_desktop_config.json` profile:
+```json
+{
+  "mcpServers": {
+    "ibkr_portmanteau": {
+      "command": "python",
+      "args": ["C:/path/to/ibkr-portmanteau/server.py", "--transport", "stdio"],
+      "env": {
+        "FRED_API_KEY": "your_api_key_here",
+        "IBKR_GATEWAY_URL": "https://localhost:5000/v1/api"
+      }
+    }
+  }
+}
+```
+
+#### For Cursor / VS Code (MCP Extensions)
+1. Open Cursor Settings -> **Models** -> **MCP**.
+2. Click **+ Add New MCP Server**.
+3. Set Name to `ibkr_portmanteau`, Type to `command`.
+4. Insert Command: `python /absolute/path/to/ibkr-portmanteau/server.py --transport stdio`
+
 ---
 
 ## ☁️ Cloud Deployment Guide (Oracle Cloud / VPS)
@@ -88,7 +114,7 @@ The optimal design pattern to connect securely from any remote machine relies on
              ↓ (Private, encrypted WireGuard mesh tunnel)
        [Tailscale Network]
              ↓
-[Your Cloud VPS Instance (MCP Server)] ──→ [Yahoo/Binance/FRED/World Bank]
+[Your Cloud VPS Instance (MCP Server)] ──rightarrow [Yahoo/Binance/FRED/World Bank]
              ↓ (Internal mesh traffic routed securely home)
 [Your Home PC (Active Client Portal Gateway Bridge)]
 ```
@@ -96,8 +122,8 @@ The optimal design pattern to connect securely from any remote machine relies on
 ### Deployment Steps on Oracle Cloud (Ubuntu Compute Instance):
 1. **Install Tailscale**: Install the Tailscale agent on both your home machine (where the IBKR Gateway runs) and your Oracle Cloud instance. This creates a secure peer-to-peer network overlay without opening raw firewall ports.
 2. **Route the Gateway API Pipeline**: Configure the network pointer variable on your cloud instance to route traffic through your home machine's private Tailscale node IP:
-   ```bash
-   export IBKR_GATEWAY_URL="https://100.X.X.X:5000/v1/api"  # Your Home Machine's Tailscale IP
+```bash
+   export IBKR_GATEWAY_URL="[https://100.](https://100.)X.X.X:5000/v1/api"  # Your Home Machine's Tailscale IP
    ```
 3. **Deploy the Environment**: Clone this repository into your cloud instance, install the updated `requirements.txt` manifests, and launch the server. Use the SSE (Server-Sent Events) transport flag if exposing the server to external API gateways, or keep it on `stdio` if your LLM client runs natively on that same machine virtual stack.
 
@@ -108,11 +134,11 @@ The optimal design pattern to connect securely from any remote machine relies on
 Once initialized, the server automatically registers the following analytical capabilities directly into your LLM's context window:
 
 1. `search_instrument`: Free-text asset discovery across global equity networks to resolve unknown symbols.
-2. `get_market_snapshot`: Real-time quote captures, including order book spreads (Bid/Ask) and volatility indices (built-in automated handling for global tickers like Nintendo via `7974.T`).
+2. `get_market_snapshot`: Real-time quote captures, including order book spreads (Bid/Ask) and asset parameters (built-in automated handling for global tickers like Nintendo via `7974.T`).
 3. `get_historical_ohlcv`: Custom financial time-series bars (OHLCV) with dynamic window framing variables (`limit`).
 4. `get_fx_rate`: Spot currency exchange rate conversion matching live data layers (essential for multi-asset opportunistic accounts).
-5. `get_options_chain_with_greeks`: Options liquidity chain ingestion, computing real-time **Delta, Gamma, Vega, and Theta** metrics via a native Black-Scholes mathematical engine.
-6. `get_portfolio_summary`: Automated consolidated balance sweeps, Net Liquidation Value (NLV) calculations, and **immediate portfolio stress-testing scenarios under market drops (-10%, -20%)**.
+5. `get_options_chain_with_greeks`: Options liquidity chain ingestion, extracting data from live broker endpoints or fallback nodes, computing real-time **Delta, Gamma, Vega, Theta**, and Newton-Raphson implied volatilities vectorially.
+6. `get_portfolio_summary`: Automated consolidated balance sweeps, Net Liquidation Value (NLV) calculations, aggregated **Dollar-Greeks exposures (Delta Dollars, Gamma Dollars)**, fixed-income yield shock metrics, and **immediate portfolio stress-testing scenarios under severe market drops (-10%, -20%) with institutional skew expansion adjustments**.
 
 ---
 
