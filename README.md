@@ -134,7 +134,7 @@ The optimal design pattern to connect securely from any remote machine relies on
 Once initialized, the server automatically registers the following analytical capabilities directly into your LLM's context window:
 
 1. `search_instrument`: Free-text asset discovery across global equity networks to resolve unknown symbols.
-2. `get_market_snapshot`: Real-time quote captures, including order book spreads (Bid/Ask) and asset parameters (built-in automated handling for global tickers like Nintendo via `7974.T`).
+2. `get_market_snapshot`: Real-time quote captures, including order book spreads (Bid/Ask) and asset parameters (built-in automated handling for global tickers).
 3. `get_historical_ohlcv`: Custom financial time-series bars (OHLCV) with dynamic window framing variables (`limit`).
 4. `get_fx_rate`: Spot currency exchange rate conversion matching live data layers (essential for multi-asset opportunistic accounts).
 5. `get_options_chain_with_greeks`: Options liquidity chain ingestion, extracting data from live broker endpoints or fallback nodes, computing real-time **Delta, Gamma, Vega, Theta**, and Newton-Raphson implied volatilities vectorially.
