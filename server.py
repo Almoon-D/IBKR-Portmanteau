@@ -18,6 +18,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
+from collections import defaultdict
 
 import httpx
 import numpy as np
@@ -98,7 +99,10 @@ def calculate_bsm_prices_vectorized(spot: np.ndarray, strikes: np.ndarray, dtes:
     r = rate_pct / 100.0
     q = dividend_yield_pct / 100.0
     
-    d1 = (np.log(spot / strikes) + (r - q + (sigma ** 2) / 2.0) * T) / (sigma * np.sqrt(T))
+    safe_strikes = np.maximum(strikes, 0.001)
+    safe_spot = np.maximum(spot, 0.001)
+    
+    d1 = (np.log(safe_spot / safe_strikes) + (r - q + (sigma ** 2) / 2.0) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
     
     cnd_d1 = _cnd_vectorized(d1)
@@ -106,8 +110,8 @@ def calculate_bsm_prices_vectorized(spot: np.ndarray, strikes: np.ndarray, dtes:
     cnd_minus_d1 = _cnd_vectorized(-d1)
     cnd_minus_d2 = _cnd_vectorized(-d2)
     
-    price_call = spot * np.exp(-q * T) * cnd_d1 - strikes * np.exp(-r * T) * cnd_d2
-    price_put = strikes * np.exp(-r * T) * cnd_minus_d2 - spot * np.exp(-q * T) * cnd_minus_d1
+    price_call = safe_spot * np.exp(-q * T) * cnd_d1 - safe_strikes * np.exp(-r * T) * cnd_d2
+    price_put = safe_strikes * np.exp(-r * T) * cnd_minus_d2 - safe_spot * np.exp(-q * T) * cnd_minus_d1
     
     return np.where(is_calls, price_call, price_put)
 
@@ -120,8 +124,8 @@ def calculate_greeks_vectorized(spot: float, strikes: np.ndarray, dtes: np.ndarr
     sigma = np.maximum(ivs_pct / 100.0, 0.0001)
     r = rate_pct / 100.0
     q = dividend_yield_pct / 100.0
-    S = spot
-    K = strikes
+    S = max(spot, 0.001)
+    K = np.maximum(strikes, 0.001)
     
     d1 = (np.log(S / K) + (r - q + (sigma ** 2) / 2.0) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
@@ -161,7 +165,7 @@ def calculate_greeks_vectorized(spot: float, strikes: np.ndarray, dtes: np.ndarr
     return results
 
 def calculate_iv_vectorized(spot: float, strikes: np.ndarray, dtes: np.ndarray, market_prices: np.ndarray, rate_pct: float, is_calls: np.ndarray, dividend_yield_pct: float = 0.0) -> np.ndarray:
-    """Derives Implied Volatility directly from options mid-market spreads using a vectorized Newton-Raphson engine."""
+    """Derives Implied Volatility directly from options mid-market spreads using a vectorized Newton-Raphson engine with localized item masking optimizations."""
     if len(strikes) == 0:
         return np.array([])
         
@@ -169,23 +173,32 @@ def calculate_iv_vectorized(spot: float, strikes: np.ndarray, dtes: np.ndarray, 
     r = rate_pct / 100.0
     q = dividend_yield_pct / 100.0
     
+    safe_strikes = np.maximum(strikes, 0.001)
+    safe_spot = max(spot, 0.001)
+    
     sigma = np.full(len(strikes), 0.35)
     
     for _ in range(12):
-        d1 = (np.log(spot / strikes) + (r - q + (sigma ** 2) / 2.0) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(safe_spot / safe_strikes) + (r - q + (sigma ** 2) / 2.0) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
         
-        price_call = spot * np.exp(-q * T) * _cnd_vectorized(d1) - strikes * np.exp(-r * T) * _cnd_vectorized(d2)
-        price_put = strikes * np.exp(-r * T) * _cnd_vectorized(-d2) - spot * np.exp(-q * T) * _cnd_vectorized(-d1)
+        price_call = safe_spot * np.exp(-q * T) * _cnd_vectorized(d1) - safe_strikes * np.exp(-r * T) * _cnd_vectorized(d2)
+        price_put = safe_strikes * np.exp(-r * T) * _cnd_vectorized(-d2) - safe_spot * np.exp(-q * T) * _cnd_vectorized(-d1)
         current_prices = np.where(is_calls, price_call, price_put)
         
         diff = current_prices - market_prices
-        nd_prime_d1 = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * d1 * d1)
-        vega = np.maximum(spot * np.exp(-q * T) * np.sqrt(T) * nd_prime_d1, 1e-5)
+        abs_diff = np.abs(diff)
         
-        sigma = np.clip(sigma - diff / vega, 0.01, 4.0)
-        if np.max(np.abs(diff)) < 1e-4:
+        not_converged = abs_diff >= 1e-4
+        if not np.any(not_converged):
             break
+            
+        nd_prime_d1 = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * d1 * d1)
+        vega = np.maximum(safe_spot * np.exp(-q * T) * np.sqrt(T) * nd_prime_d1, 1e-5)
+        
+        sigma[not_converged] = np.clip(
+            sigma[not_converged] - diff[not_converged] / vega[not_converged], 0.01, 4.0
+        )
             
     return sigma * 100.0
 
@@ -389,7 +402,6 @@ class MarketFacade:
 
         async with self.network_semaphore:
             try:
-                # FIXED: Swapped to the quote endpoint to guarantee asset resolution across all non-optionable equities cleanly
                 url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
                 resp = await self.http.get(url)
                 if resp.status_code != 200:
@@ -402,7 +414,7 @@ class MarketFacade:
                 quote = res_list[0]
                 div_yield = _safe_float(quote.get("trailingAnnualDividendYield", quote.get("dividendYield", 0.0)))
                 if div_yield < 1.0 and div_yield > 0.0:
-                    div_yield *= 100.0  # Safe scale configuration matching core percentage rules
+                    div_yield *= 100.0  
                     
                 last_p = _safe_float(quote.get("regularMarketPrice"))
                 result = {
@@ -431,7 +443,15 @@ class MarketFacade:
                 if resp.status_code != 200:
                     return {"error": "Historical series structural payload context unavailable"}
                 
-                root = resp.json()["chart"]["result"][0]
+                payload = resp.json()
+                chart_data = payload.get("chart", {})
+                result_list = chart_data.get("result")
+                
+                if not result_list or result_list[0] is None:
+                    error_msg = chart_data.get("error", {}).get("description", "Asset symbol not found or delisted.")
+                    return {"error": f"Yahoo Finance Error: {error_msg}"}
+                
+                root = result_list[0]
                 timestamps = root.get("timestamp", [])
                 indicators = root.get("indicators", {}).get("quote", [{}])[0]
                 
@@ -477,7 +497,18 @@ class MarketFacade:
             try:
                 url = f"https://query1.finance.yahoo.com/v8/finance/chart/{pair}?interval=1m&range=1d"
                 resp = await self.http.get(url)
-                meta = resp.json()["chart"]["result"][0]["meta"]
+                if resp.status_code != 200:
+                    return {"error": f"FX rate service unavailable (Status {resp.status_code})"}
+                
+                payload = resp.json()
+                chart_data = payload.get("chart", {})
+                result_list = chart_data.get("result")
+                
+                if not result_list or result_list[0] is None:
+                    error_msg = chart_data.get("error", {}).get("description", "Invalid currency layer codes.")
+                    return {"error": f"Yahoo Finance Error: {error_msg}"}
+                    
+                meta = result_list[0].get("meta", {})
                 rate = _safe_float(meta.get("regularMarketPrice"))
                 if rate <= 0:
                     return {"error": f"Failed structural extraction context for {pair}"}
@@ -488,7 +519,7 @@ class MarketFacade:
             except Exception as e: 
                 return {"error": str(e)}
 
-    async def get_options_chain_with_greeks(self, ticker: str, max_expiry_days: int, moneyness_range: float, risk_free_rate: float) -> dict[str, Any]:
+    async def get_options_chain_with_greeks(self, ticker: str, max_expiry_days: int, moneyness_range: float, risk_free_rate: Optional[float] = None) -> dict[str, Any]:
         cache_key = f"greeks_chain:{ticker}:{max_expiry_days}:{moneyness_range}"
         cached = await self.cache.get(cache_key)
         if cached: 
@@ -501,8 +532,8 @@ class MarketFacade:
         if spot_price <= 0:
             return {"error": "Cannot map options structures without valid spot price foundations."}
 
-        effective_rf = risk_free_rate
-        if FRED_API_KEY and time.time() > self.fred_cooldown_until:
+        effective_rf = risk_free_rate if risk_free_rate is not None else 4.5
+        if risk_free_rate is None and FRED_API_KEY and time.time() > self.fred_cooldown_until:
             try:
                 cached_rf = await self.cache.get("macro:rf_rate:DTB3")
                 if cached_rf is not None:
@@ -526,7 +557,8 @@ class MarketFacade:
                 
                 now_ts = time.time()
                 cutoff_ts = now_ts + (max_expiry_days * 86400)
-                valid_timestamps = [ts for ts in exp_timestamps if now_ts < ts <= cutoff_ts][:4]
+                # Fixed pre-existing weeklies expansion ceiling from 4 to 15 entries
+                valid_timestamps = [ts for ts in exp_timestamps if now_ts < ts <= cutoff_ts][:15]
                 
                 tasks = [self.http.get(f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}?date={ts}") for ts in valid_timestamps]
                 chain_responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -568,6 +600,17 @@ class MarketFacade:
                             })
                             
                 if processed_contracts:
+                    by_expiry = defaultdict(list)
+                    for c in processed_contracts:
+                        by_expiry[c["expiry"]].append(c)
+                        
+                    balanced_contracts = []
+                    for exp_date, c_list in by_expiry.items():
+                        c_list.sort(key=lambda x: abs(x["strike"] - spot_price))
+                        balanced_contracts.extend(c_list[:20])  
+                        
+                    processed_contracts = balanced_contracts
+                    
                     strikes_arr = np.array([c["strike"] for c in processed_contracts])
                     dtes_arr = np.array([c["dte"] for c in processed_contracts])
                     mkt_prices_arr = np.array([c["mid"] for c in processed_contracts])
@@ -581,8 +624,8 @@ class MarketFacade:
                         c["greeks"] = greeks_surface[i]
                         del c["is_call"]
                         
-                    processed_contracts.sort(key=lambda x: abs(x["strike"] - spot_price))
-                    result = {"ticker": ticker, "underlying_price": round(spot_price, 2), "option_contracts": processed_contracts[:80]}
+                    processed_contracts.sort(key=lambda x: (x["expiry"], abs(x["strike"] - spot_price)))
+                    result = {"ticker": ticker, "underlying_price": round(spot_price, 2), "option_contracts": processed_contracts}
                     await self.cache.set(cache_key, result, TTL_OPTION_SECS)
                     return result
             except Exception as e:
@@ -637,7 +680,16 @@ class PortfolioEngine:
     def __init__(self, ibkr: IBKRGateway) -> None:
         self.ibkr = ibkr
 
-    async def analyze(self, market: Optional[MarketFacade] = None) -> dict[str, Any]:
+    async def _fetch_contract_info_safe(self, conid: int) -> Optional[dict[str, Any]]:
+        try:
+            resp = await self.ibkr.client.get(f"{IBKR_BASE}/iserver/contract/{conid}/info")
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
+    async def analyze(self, market: Optional[MarketFacade] = None, risk_free_rate: Optional[float] = None) -> dict[str, Any]:
         if not self.ibkr.healthy: 
             return {"status": "OFFLINE", "error": "Native IBKR Execution Gateway Proxy Disconnected"}
         try:
@@ -712,20 +764,33 @@ class PortfolioEngine:
                         underlying_spots[t] = _safe_float(res["last"])
                         underlying_yields[t] = _safe_float(res.get("dividend_yield_pct", 0.0))
 
-            effective_rf = 4.5
-            if market and market.cache:
+            effective_rf = risk_free_rate if risk_free_rate is not None else 4.5
+            if risk_free_rate is None and market and market.cache:
                 cached_rf = await market.cache.get("macro:rf_rate:DTB3")
                 if cached_rf is not None:
                     effective_rf = float(cached_rf)
 
             stress_scenarios = {}
-            skipped_positions = []  # FIXED: Collect and expose structural portfolio data exceptions
+            skipped_positions = []  
             
             if options_positions:
+                resolution_tasks = []
+                for p in options_positions:
+                    strike = _safe_float(p.get("strike"))
+                    expiry_str = p.get("expiry", "")
+                    conid = p.get("conid")
+                    if (strike <= 0 or not expiry_str) and conid:
+                        resolution_tasks.append(self._fetch_contract_info_safe(int(conid)))
+                    else:
+                        resolution_tasks.append(asyncio.sleep(0, result=None))
+                        
+                # Fixed concurrency landmine by ensuring single request issues do not drop the analysis thread
+                resolved_infos = await asyncio.gather(*resolution_tasks, return_exceptions=True)
+                
                 valid_opts = []
                 spots_arr, strikes_arr, dtes_arr, ivs_arr, calls_mask, sizes_arr, fx_arr, multipliers_arr, yields_arr = [], [], [], [], [], [], [], [], []
                 
-                for p in options_positions:
+                for idx, p in enumerate(options_positions):
                     ticker = p.get("symbol", p.get("ticker", "")).upper()
                     contract_desc = p.get("contractDesc", "")
                     if not ticker and contract_desc:
@@ -736,6 +801,12 @@ class PortfolioEngine:
                     expiry_str = p.get("expiry", "")
                     right = p.get("putCall", p.get("right", "C")).upper()
                     
+                    info = resolved_infos[idx]
+                    if info and isinstance(info, dict):
+                        strike = _safe_float(info.get("strike"))
+                        expiry_str = info.get("expiry", "")
+                        right = info.get("right", info.get("putCall", "C")).upper()
+
                     if (strike <= 0 or not expiry_str) and contract_desc:
                         parts = contract_desc.split()
                         if len(parts) >= 4:  
@@ -769,7 +840,11 @@ class PortfolioEngine:
                         expiry_dt = datetime.strptime(expiry_str, "%Y%m%d").replace(tzinfo=timezone.utc)
                         dte = max((expiry_dt - datetime.now(timezone.utc)).days, 1)
                     except Exception:
-                        dte = 30
+                        try:
+                            expiry_dt = datetime.strptime(expiry_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                            dte = max((expiry_dt - datetime.now(timezone.utc)).days, 1)
+                        except Exception:
+                            dte = 30
                     
                     iv_val = _safe_float(p.get("impliedVol", p.get("impliedVolatility")))
                     ivs_arr.append(iv_val * 100.0 if iv_val > 0 else 32.0)
@@ -836,7 +911,7 @@ class PortfolioEngine:
                 "stress_scenarios": stress_scenarios
             }
             if skipped_positions:
-                output_payload["warnings"] = skipped_positions  # FIXED: Explicit transparency instead of silent drops
+                output_payload["warnings"] = skipped_positions  
                 
             return output_payload
         except Exception as e: 
@@ -905,14 +980,14 @@ async def get_fx_rate(base: str, quote: str) -> str:
     return json.dumps(await _market.get_fx_rate(base, quote), indent=2)
 
 @mcp.tool(name="get_options_chain_with_greeks")
-async def get_options_chain_with_greeks(ticker: str, max_expiry_days: int = 60, moneyness_range: float = 0.15, risk_free_rate: float = 4.5) -> str:
+async def get_options_chain_with_greeks(ticker: str, max_expiry_days: int = 60, moneyness_range: float = 0.15, risk_free_rate: Optional[float] = None) -> str:
     """Return the options liquidity matrix, injecting dynamic Newton-Raphson derived implied volatility, Delta, Gamma, Vega, and Theta metrics."""
     return json.dumps(await _market.get_options_chain_with_greeks(ticker, max_expiry_days, moneyness_range, risk_free_rate), indent=2)
 
 @mcp.tool(name="get_portfolio_summary")
-async def get_portfolio_summary() -> str:
+async def get_portfolio_summary(risk_free_rate: Optional[float] = None) -> str:
     """Pull real-time balances, multi-currency assets net liquidation value, and active exposure stress-testing metrics."""
-    return json.dumps(await _portfolio.analyze(_market), indent=2)
+    return json.dumps(await _portfolio.analyze(_market, risk_free_rate=risk_free_rate), indent=2)
 
 @mcp.tool(name="get_global_macro_scanner")
 async def get_global_macro_scanner(indicator_id: str, region: str) -> str:
@@ -922,13 +997,25 @@ async def get_global_macro_scanner(indicator_id: str, region: str) -> str:
 @mcp.tool(name="query_ibkr_endpoint")
 async def query_ibkr_endpoint(endpoint: str, params_json: Optional[str] = None) -> str:
     """Bypass high-level tools and execute direct queries against the IBKR Client Portal REST API."""
+    clean_endpoint = endpoint.lower().strip().lstrip("/")
+    
+    dangerous_patterns = ["order", "trade", "buy", "sell", "submit", "replace", "cancel", "delete", "modify"]
+    if any(p in clean_endpoint for p in dangerous_patterns):
+        return json.dumps({"error": "Unauthorized: Command string contains destructive or non-read-only state-altering structural keywords."})
+        
+    allowed_post_endpoints = ["iserver/scanner/run", "tickle", "logout"]
+    # Fixed route breaking validation by utilizing prefix containment patterns instead of rigid absolute matching rules
+    is_explicit_post_whitelist = any(clean_endpoint.startswith(path) for path in allowed_post_endpoints)
+    
     try:
         p = json.loads(params_json) if params_json else {}
         url = f"{IBKR_BASE}/{endpoint.lstrip('/')}"
-        if any(x in endpoint for x in ["orders", "run", "reply", "tickle"]):
+        
+        if is_explicit_post_whitelist:
             resp = await _ibkr.client.post(url, json=p)
         else:
             resp = await _ibkr.client.get(url, params=p)
+            
         return json.dumps(resp.json(), indent=2)
     except Exception as e: 
         return json.dumps({"error": str(e)})
